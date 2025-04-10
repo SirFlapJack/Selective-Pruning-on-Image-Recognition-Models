@@ -11,7 +11,6 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
 
-# Load the model (pre-trained ResNet-18)
 net = models.resnet18(weights=None, num_classes=10)
 net.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False) # Modify the first convolutional layer to accept 1 input channel
 
@@ -83,7 +82,6 @@ def save_confusion_matrix(cm, class_names, filepath, cmap='Blues'):
     plt.savefig(unique_filepath)
     plt.close()
 
-# Load class names
 class_names = datasets.MNIST(root='./data', train=True, download=True).classes
 
 # Data transformation and loading
@@ -95,20 +93,16 @@ transform = transforms.Compose([
 test_data = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
 test_loader = DataLoader(test_data, batch_size=1, shuffle=True)
 
-# Parameters
 epsilon = 0.01
 num_images = 300
 
-# Create directory to save images
 output_dir = 'perturbed_images'
 os.makedirs(output_dir, exist_ok=True)
 
-# Lists to store true and predicted labels for confusion matrix
 true_labels = []
 original_preds = []
 adversarial_preds = []
 
-# Counters
 correct_original = 0
 correct_adversarial = 0
 
@@ -116,25 +110,19 @@ for i, (data, target) in enumerate(test_loader):
     if i >= num_images:
         break
 
-    # Move data and target to CPU (if not already)
     data, target = data.to(device), target.to(device)
-
-    # Make a copy of the data for adversarial processing
     data_copy = data.clone().detach()
 
     output = net(data_copy)
     original_pred = output.argmax(dim=1, keepdim=True)
     correct_original += original_pred.eq(target.view_as(original_pred)).sum().item()
 
-    # Generate adversarial example
     adversarial_data = generate_fgsm_adversarial_example(net, data_copy, target, epsilon)
 
-    # Adversarial prediction
     output = net(adversarial_data)
     adversarial_pred = output.argmax(dim=1, keepdim=True)
     correct_adversarial += adversarial_pred.eq(target.view_as(adversarial_pred)).sum().item()
 
-    # Save original and perturbed images
     original_class = class_names[original_pred.item()]
     adversarial_class = class_names[adversarial_pred.item()]
 
@@ -147,7 +135,6 @@ for i, (data, target) in enumerate(test_loader):
     save_image_with_classification(data, f'Original: {original_class}', original_image_path)
     save_image_with_classification(adversarial_data, f'Adversarial: {adversarial_class}', adversarial_image_path)
 
-    # Append to confusion matrix lists
     true_labels.append(target.item())
     original_preds.append(original_pred.item())
     adversarial_preds.append(adversarial_pred.item())
@@ -156,17 +143,14 @@ for i, (data, target) in enumerate(test_loader):
     print('Original prediction:',  original_class)
     print('Adversarial prediction:', adversarial_class)
 
-# Calculate accuracy
 accuracy_original = correct_original / num_images
 accuracy_adversarial = correct_adversarial / num_images
 
 print(f'\nAccuracy on original images: {accuracy_original * 100:.2f}%')
 print(f'Accuracy on adversarial images: {accuracy_adversarial * 100:.2f}%')
 
-# Confusion matrices
 cm_original = confusion_matrix(true_labels, original_preds)
 cm_adversarial = confusion_matrix(true_labels, adversarial_preds)
 
-# Save confusion matrices as images with unique names
 save_confusion_matrix(cm_original, class_names, f'cm-with-original-{num_images}.png', cmap='Blues')
 save_confusion_matrix(cm_adversarial, class_names, f'cm-with-adversarial-{num_images}.png', cmap='Reds')
