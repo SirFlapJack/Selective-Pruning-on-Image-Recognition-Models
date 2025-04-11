@@ -1,0 +1,171 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import torchvision.models as models
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+
+# Load the model (pre-trained ResNet-18)
+net = models.resnet18(weights=None, num_classes=10)
+net.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False) # Modify the first convolutional layer to accept 1 input channel
+
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+else:
+    device = torch.device('cpu')
+
+try:
+    net.load_state_dict(torch.load('/content/best_resnet18_MINST_97-59.pth', map_location=torch.device(device)))
+    net.eval()
+except FileNotFoundError:
+    print("Error: Model file not found. Ensure '/content/best_resnet18_MINST_96.90%_23epoch_WithOut_Transformation.pth' exists.")
+    exit(1)
+
+print(f"Using device: {device}\n\n")
+
+def save_image_with_classification(image_data, classification, filepath):
+    image = np.transpose(image_data.squeeze(0).detach().numpy(), (1, 2, 0))
+    image = np.clip(image, 0, 1)
+    plt.imshow(image)
+    plt.title(classification)
+    plt.axis('off')
+    plt.savefig(filepath)
+    plt.close()
+
+def fgsm_attack(data, epsilon, data_grad):
+    sign_data_grad = data_grad.sign()
+    perturbed_data = data + epsilon * sign_data_grad
+    perturbed_data = torch.clamp(perturbed_data, 0, 1)
+    return perturbed_data
+
+# def generate_fgsm_adversarial_example(model, data, target, epsilon):
+#     data_copy = data.clone().detach().requires_grad_(True)  # Clone and set requires_grad to True
+#     output = model(data_copy)
+#     loss = nn.CrossEntropyLoss()(output, target)
+#     #loss = -nn.CrossEntropyLoss()(output, target) # negative sign to maximize the loss # Modify to maximize the loss for target class -> makes it targeted attack for the class htat produces the most activatioın or the class that has the most common features
+#     model.zero_grad()
+#     loss.backward()
+#     data_grad = data_copy.grad.data
+#     perturbed_data = fgsm_attack(data_copy, epsilon, data_grad)
+#     return perturbed_data
+
+def generate_fgsm_adversarial_example(model, data, target, epsilon):
+    data_copy = data.clone().detach().requires_grad_(True)
+    output = model(data_copy)
+    loss = nn.CrossEntropyLoss()(output, target)  # Minimize loss for the true class
+    model.zero_grad()
+    loss.backward()
+    data_grad = data_copy.grad.data
+    perturbed_data = fgsm_attack(data_copy, epsilon, data_grad)
+    return perturbed_data
+
+def save_confusion_matrix(cm, class_names, filepath, cmap='Blues'):
+    def get_unique_filepath(filepath):
+        base, ext = os.path.splitext(filepath)
+        counter = 1
+        unique_filepath = filepath
+        while os.path.exists(unique_filepath):
+            unique_filepath = f"{base}_{counter}{ext}"
+            counter += 1
+        return unique_filepath
+
+    unique_filepath = get_unique_filepath(filepath)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap=cmap, xticklabels=class_names, yticklabels=class_names)
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.savefig(unique_filepath)
+    plt.close()
+
+# Load class names
+class_names = datasets.MNIST(root='./data', train=True, download=True).classes
+
+# Data transformation and loading
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,)) # (0.5,), (0.5,)Since i am using the model trained without any transformation i will comment out this part
+])
+
+test_data = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+test_loader = DataLoader(test_data, batch_size=1, shuffle=True)
+
+# Parameters
+epsilon = 0.01
+num_images = 300
+
+# Create directory to save images
+output_dir = 'perturbed_images'
+os.makedirs(output_dir, exist_ok=True)
+
+# Lists to store true and predicted labels for confusion matrix
+true_labels = []
+original_preds = []
+adversarial_preds = []
+
+# Counters
+correct_original = 0
+correct_adversarial = 0
+
+for i, (data, target) in enumerate(test_loader):
+    if i >= num_images:
+        break
+
+    # Move data and target to CPU (if not already)
+    data, target = data.to(device), target.to(device)
+
+    # Make a copy of the data for adversarial processing
+    data_copy = data.clone().detach()
+
+    output = net(data_copy)
+    original_pred = output.argmax(dim=1, keepdim=True)
+    correct_original += original_pred.eq(target.view_as(original_pred)).sum().item()
+
+    # Generate adversarial example
+    adversarial_data = generate_fgsm_adversarial_example(net, data_copy, target, epsilon)
+
+    # Adversarial prediction
+    output = net(adversarial_data)
+    adversarial_pred = output.argmax(dim=1, keepdim=True)
+    correct_adversarial += adversarial_pred.eq(target.view_as(adversarial_pred)).sum().item()
+
+    # Save original and perturbed images
+    original_class = class_names[original_pred.item()]
+    adversarial_class = class_names[adversarial_pred.item()]
+
+    image_dir = os.path.join(output_dir, f'image{i}')
+    os.makedirs(image_dir, exist_ok=True)
+
+    original_image_path = os.path.join(image_dir, f'image{i}.png')
+    adversarial_image_path = os.path.join(image_dir, f'image{i}_perturbed.png')
+
+    save_image_with_classification(data, f'Original: {original_class}', original_image_path)
+    save_image_with_classification(adversarial_data, f'Adversarial: {adversarial_class}', adversarial_image_path)
+
+    # Append to confusion matrix lists
+    true_labels.append(target.item())
+    original_preds.append(original_pred.item())
+    adversarial_preds.append(adversarial_pred.item())
+
+    print(f'Image {i+1}/{num_images}')
+    print('Original prediction:',  original_class)
+    print('Adversarial prediction:', adversarial_class)
+
+# Calculate accuracy
+accuracy_original = correct_original / num_images
+accuracy_adversarial = correct_adversarial / num_images
+
+print(f'\nAccuracy on original images: {accuracy_original * 100:.2f}%')
+print(f'Accuracy on adversarial images: {accuracy_adversarial * 100:.2f}%')
+
+# Confusion matrices
+cm_original = confusion_matrix(true_labels, original_preds)
+cm_adversarial = confusion_matrix(true_labels, adversarial_preds)
+
+# Save confusion matrices as images with unique names
+save_confusion_matrix(cm_original, class_names, f'cm-with-original-{num_images}.png', cmap='Blues')
+save_confusion_matrix(cm_adversarial, class_names, f'cm-with-adversarial-{num_images}.png', cmap='Reds')
