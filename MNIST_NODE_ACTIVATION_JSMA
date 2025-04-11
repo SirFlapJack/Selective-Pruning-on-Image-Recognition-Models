@@ -1,0 +1,187 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import torchvision.models as models
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+# Load the model (pre-trained ResNet-18)
+net = models.resnet18(weights=None, num_classes=10)
+net.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False) # Modify the first convolutional layer to accept 1 input channel
+
+try:
+    net.load_state_dict(torch.load('/content/best_resnet18_MINST_97-59.pth', map_location=torch.device('cpu')))
+    net.eval()
+except FileNotFoundError:
+    print("Error: Model file not found. Ensure '/content/best_resnet18_MINST_97-59.pth' exists.")
+    exit(1)
+#### bunlar CIFAR için bunu MNIST içintekrardan hesapla ve hesaplarken fetarue space çıktısı da al
+#şimdilik rastgele classlar için deniyor olacağım
+
+target_classes_mapping = {
+    0: 6,  # 0 -> 6
+    1: 7,  # 1 -> 7
+    2: 3,  # 2 -> 3
+    3: 8,  # 3 -> 8
+    4: 9,  # 4 -> 9
+    5: 3,  # 5 -> 3
+    6: 8,  # 6 -> 8 (or 0, 5)
+    7: 1,  # 7 -> 1
+    8: 6,  # 8 -> 3 (or 0, 6)
+    9: 8   # 9 -> 4 (or 7)
+}
+
+epsilon = 0.01
+
+# JSMA attack implementation
+def targeted_jsma_attack(model, data, target_class, epsilon=epsilon, num_classes=10):
+    data.requires_grad = True
+    output = model(data)
+
+    gradients = []
+    for i in range(num_classes):
+        model.zero_grad()
+        output[0, i].backward(retain_graph=True)
+        gradients.append(data.grad.data.clone())
+        data.grad.data.zero_()
+    gradients = torch.stack(gradients)  # Shape: [num_classes, 3, 32, 32] this might not be true since mnist dataset includes images with 1 channel and not 3 as RGB yet only black and white
+
+    target_grad = gradients[target_class]
+    saliency_map = target_grad.sign()
+
+    perturbation = epsilon * saliency_map
+    perturbed_data = data + perturbation
+    perturbed_data = torch.clamp(perturbed_data, 0, 1)
+
+    return perturbed_data
+
+# Save images with classifications
+def save_image_with_classification(image_data, classification, filepath):
+    image = np.transpose(image_data.squeeze(0).detach().numpy(), (1, 2, 0))
+    image = np.clip(image, 0, 1)
+    plt.imshow(image)
+    plt.title(classification)
+    plt.axis('off')
+    plt.savefig(filepath)
+    plt.close()
+
+# Hook for activations (node-level)
+def get_node_activation_hook(name, store_dict):
+    def hook(model, input, output):
+        # Store the entire layer's activation
+        store_dict[name] = output.detach().cpu()  # Shape: [batch_size, channels, height, width]
+    return hook
+
+# Helper function to compute node vulnerabilities
+def compute_node_vulnerabilities(original_activations, adversarial_activations):
+    node_vulnerabilities = {}
+    for layer_name in original_activations.keys():
+        if layer_name in adversarial_activations:
+            original = original_activations[layer_name]
+            adversarial = adversarial_activations[layer_name]
+
+            # Compute node-level differences (L2 norm for each channel)
+            differences = (adversarial - original).norm(2, dim=(0, 2, 3))  # L2 norm per channel
+            node_vulnerabilities[layer_name] = differences.tolist()  # Convert tensor to list for readability
+    return node_vulnerabilities
+
+# MNIST class names
+class_names = datasets.MNIST(root='./data', train=True, download=True).classes
+
+# Data transformation and loading
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+
+test_data = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+test_loader = DataLoader(test_data, batch_size=1, shuffle=True)
+
+
+num_images = 300
+output_dir = './output_images'
+os.makedirs(output_dir, exist_ok=True)
+
+# Lists to collect results
+all_labels = []
+all_original_preds = []
+all_adversarial_preds = []
+target_class_success = 0  # Tracks how many perturbed images are classified as the target class
+correct_original = 0
+correct_adversarial = 0
+
+# Helper function to register hooks
+def register_hooks(model, activation_store):
+    hooks = []
+    for name, layer in model.named_modules():
+        if isinstance(layer, (nn.ReLU, nn.Conv2d)):
+            hooks.append(layer.register_forward_hook(get_node_activation_hook(name, activation_store)))
+    return hooks
+
+# Initialize variable to count the number of perturbed images created
+num_perturbed_images = 0
+
+# Process images
+for i, (data, target) in enumerate(test_loader):
+    if i >= num_images:
+        break
+
+    data, target = data.to('cpu'), target.to('cpu')
+    all_labels.append(target.item())
+
+    # Original activations
+    original_activations = {}
+    original_hooks = register_hooks(net, original_activations)
+
+    # Original prediction
+    with torch.no_grad():
+        output = net(data)
+    original_pred = output.argmax(dim=1).item()
+    all_original_preds.append(original_pred)
+    correct_original += (original_pred == target.item())
+
+    # Remove original hooks
+    for hook in original_hooks:
+        hook.remove()
+
+    # Adversarial example generation for the determined target class
+    adversarial_activations = {}
+    adversarial_hooks = register_hooks(net, adversarial_activations)
+
+    # Determine target class using the mapping
+    target_class = target_classes_mapping.get(target.item(), target.item())
+  #  print(f"Original Class: {class_names[target.item()]}, Target Class: {class_names[target_class]}")
+
+    adversarial_data = targeted_jsma_attack(net, data.clone(), target_class=target_class, epsilon=epsilon)
+
+    # Increment the number of perturbed images
+    num_perturbed_images += 1
+
+    # Adversarial prediction
+    with torch.no_grad():
+        output = net(adversarial_data)
+    adversarial_pred = output.argmax(dim=1).item()
+    if adversarial_pred == target_class:  # Check for success
+        target_class_success += 1
+
+    # Remove adversarial hooks
+    for hook in adversarial_hooks:
+        hook.remove()
+
+# Compute node vulnerabilities
+node_vulnerabilities = compute_node_vulnerabilities(original_activations, adversarial_activations)
+
+# Open a file to save node vulnerabilities
+output_file_path = './MNIST_JSMA_node_vulnerabilities.txt'
+with open(output_file_path, 'w') as file:
+    # Print and save node vulnerabilities
+    for layer_name, node_scores in node_vulnerabilities.items():
+        file.write(f"Node vulnerabilities for {layer_name}:\n")
+        print(f"Node vulnerabilities for {layer_name}:")
+        for node_index, score in enumerate(node_scores):
+            file.write(f"  Node {node_index}: {score:.4f}\n")
+            print(f"  Node {node_index}: {score:.4f}")
+        file.write("\n")
+print(f"Node vulnerabilities saved to {output_file_path}")
