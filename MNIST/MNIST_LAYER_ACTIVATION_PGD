@@ -1,0 +1,334 @@
+import os
+import torchvision.models as models
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics.pairwise import euclidean_distances
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import torch.nn.functional as F
+
+
+# Check for GPU availability
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+net = models.resnet18(weights=None, num_classes=10)
+net.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False) # Modify the first convolutional layer to accept 1 input channel
+net.to(device) #Move model to the GPU
+
+try:
+    net.load_state_dict(torch.load('/content/best_resnet18_MINST_97-59.pth', map_location=torch.device(device)))
+    net.eval()
+except FileNotFoundError:
+    print("Error: Model file not found. Ensure '/content/best_resnet18_MINST_97-59.pth' exists.")
+    exit(1)
+
+
+def visualize_feature_space_with_centroids(embeddings, labels, centroids, method='pca', num_classes=10, class_names=None):
+    """
+    Visualize the feature space with data points and class centroids using PCA or t-SNE.
+
+    Args:
+    - embeddings (np.array): Feature embeddings (shape: [num_samples, num_features]).
+    - labels (np.array): Corresponding class labels for the embeddings.
+    - centroids (np.array): Centroids of the classes (shape: [num_classes, num_features]).
+    - method (str): Dimensionality reduction method ('pca' or 'tsne').
+    - num_classes (int): Number of unique classes.
+    - class_names (list): List of class names for labeling centroids.
+
+    Returns:
+    - None: Displays the plot.
+    """
+    if method == 'pca':
+        reducer = PCA(n_components=2)
+        title = "Feature Space Visualization with Centroids (PCA)"
+    elif method == 'tsne':
+        reducer = TSNE(n_components=2, perplexity=30, random_state=42)
+        title = "Feature Space Visualization with Centroids (t-SNE)"
+    else:
+        raise ValueError("Unsupported method. Use 'pca' or 'tsne'.")
+
+    # Combine embeddings and centroids for joint dimensionality reduction
+    combined_embeddings = np.vstack([embeddings, centroids])
+    reduced_combined = reducer.fit_transform(combined_embeddings)
+    reduced_embeddings = reduced_combined[:-num_classes]  # Data points
+    reduced_centroids = reduced_combined[-num_classes:]   # Centroids
+
+    # Create a scatter plot
+    plt.figure(figsize=(12, 10))
+    palette = sns.color_palette("hsv", num_classes)
+
+    # Plot individual data points
+    for class_idx in range(num_classes):
+        class_mask = (labels == class_idx)
+        plt.scatter(
+            reduced_embeddings[class_mask, 0],
+            reduced_embeddings[class_mask, 1],
+            label=f"Class {class_idx}" if class_names is None else class_names[class_idx],
+            alpha=0.6,
+            color=palette[class_idx]
+        )
+
+    # Plot centroids
+    plt.scatter(
+        reduced_centroids[:, 0],
+        reduced_centroids[:, 1],
+        c='black',
+        s=150,  # Larger marker size for centroids
+        marker='X',
+        label='Class Centroids'
+    )
+
+    # Annotate centroids with class labels
+    for i, (x, y) in enumerate(reduced_centroids):
+        label = f"Class {i}" if class_names is None else class_names[i]
+        plt.text(
+            x + 0.02, y + 0.02,  # Offset text slightly to avoid overlap with marker
+            label,
+            fontsize=10,
+            color='black',
+            bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=2)
+        )
+
+    # Add labels and title
+    plt.title(title)
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.legend(loc='best', title="Classes")
+    plt.grid(True)
+    plt.show()
+
+
+# Helper function to register hooks
+def register_hooks(model, activation_store):
+    hooks = []
+    for name, layer in model.named_modules():
+        if isinstance(layer, (nn.ReLU, nn.Conv2d)):
+            hooks.append(layer.register_forward_hook(get_activation_hook(name, activation_store)))
+    return hooks
+
+# Extract embeddings for clustering
+def get_embeddings_and_labels(model, data_loader):
+    embeddings = []
+    labels = []
+    # Remove the final fully connected (fc) layer for feature extraction
+    feature_extractor = nn.Sequential(*list(model.children())[:-1])  # Up to 'avgpool'
+
+    with torch.no_grad():
+        for data, target in data_loader:
+            data, target = data.to(device), target.to(device)
+            labels.extend(target.cpu().numpy())
+
+            # Extract features using the feature extractor
+            features = feature_extractor(data)  # Shape: [batch_size, 512, 1, 1]
+            features = torch.flatten(features, 1)  # Flatten to [batch_size, 512]
+
+            embeddings.append(features.cpu().numpy())
+
+    return np.vstack(embeddings), np.array(labels)
+
+
+# Hook for activations
+def get_activation_hook(name, store_dict):
+    def hook(model, input, output):
+        store_dict[name] = output.detach().cpu()
+    return hook
+
+
+def find_closest_classes(embeddings, labels, num_classes=10, top_k=3):
+    """
+    Find the top_k closest classes for each class based on Euclidean distances.
+
+    Args:
+    - embeddings (np.array): Embeddings of all data points.
+    - labels (np.array): Corresponding labels for the data points.
+    - num_classes (int): Total number of unique classes.
+    - top_k (int): Number of closest classes to find for each class.
+
+    Returns:
+    - closest_classes (list of lists): Each sublist contains the indices of the top_k closest classes.
+    """
+    class_centroids = []
+    for c in range(num_classes):
+        class_embeddings = embeddings[labels == c]
+        centroid = class_embeddings.mean(axis=0)  # Calculate centroid for each class
+        class_centroids.append(centroid)
+
+    distances = euclidean_distances(class_centroids)  # Compute distances between centroids
+    np.fill_diagonal(distances, np.inf)  # Ignore self-distances (set to infinity)
+
+    # For each class, find the indices of the top_k closest classes
+    closest_classes = []
+    for row in distances:
+        closest_classes.append(row.argsort()[:top_k])  # Sort distances and select top_k indices
+
+    return closest_classes
+
+def pgd_attack(model, data, true_labels, epsilon, step_size, num_steps):
+    perturbed_data = data.clone().detach().to(device)  # Move to device
+    perturbed_data.requires_grad = True
+
+    for _ in range(num_steps):
+        output = model(perturbed_data)
+        #loss = F.cross_entropy(output, output.argmax(dim=1))  # Maximize loss for the predicted class
+        loss = F.cross_entropy(output, true_labels)
+
+        model.zero_grad()
+        loss.backward()
+
+        # Dynamic step size adjustment
+        # Either making he step size too small or couse it to fluctuate so i will continue with static value
+        # step_size = step_size * (1 + 0.1 * torch.norm(perturbed_data.grad).item())
+        # step_size = min(step_size, epsilon / 2)  # Cap step size
+
+        # Gradient ascent step
+        perturbed_data = perturbed_data + step_size * perturbed_data.grad.sign()
+
+        # Project back to epsilon-ball
+        perturbed_data = torch.min(torch.max(perturbed_data, data - epsilon), data + epsilon)
+        perturbed_data = torch.clamp(perturbed_data, 0, 1)
+
+        # Reinitialize gradient
+        perturbed_data = perturbed_data.detach()  # Detach to prevent accumulation
+        perturbed_data.requires_grad = True
+
+    return perturbed_data
+
+def save_image_with_classification(image_data, classification, filepath):
+    image = np.transpose(image_data.squeeze(0).detach().numpy(), (1, 2, 0))
+    image = np.clip(image, 0, 1)
+    plt.imshow(image)
+    plt.title(classification)
+    plt.axis('off')
+    plt.savefig(filepath)
+    plt.close()
+
+# Load class names
+class_names = datasets.MNIST(root='./data', train=True, download=True).classes
+
+# Data transformation and loading
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,)) # (0.1307,), (0.3081,)---- (0.5,), (0.5,)  Since i am using the model trained without any transformation i will comment out this part
+])
+
+test_data = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+test_loader = DataLoader(test_data, batch_size=1, shuffle=True)
+
+# Parameters
+epsilon = 0.01
+num_images = 300
+output_dir = './output_images'
+os.makedirs(output_dir, exist_ok=True)
+
+# PGD parameters
+step_size = epsilon / 2 #or try it by dividing to 4 as 0.0025
+num_steps = 20
+
+true_labels = []
+original_preds = []
+adversarial_preds = []
+
+# Lists to collect results
+all_labels = []
+all_original_preds = []
+all_adversarial_preds = []
+correct_original = 0
+correct_adversarial = 0
+
+# Compute closest classes in feature space
+all_embeddings, all_labels_array = get_embeddings_and_labels(net, test_loader)
+closest_classes = find_closest_classes(all_embeddings, all_labels_array, top_k=3)
+
+# Print closest 3 classes for each original class
+for idx, targets in enumerate(closest_classes):
+    target_names = [class_names[t] for t in targets]
+    print(f"Original Class: {class_names[idx]}, Closest Classes: {', '.join(target_names)}")
+
+
+# Compute centroids
+class_centroids = np.array([all_embeddings[all_labels_array == c].mean(axis=0) for c in range(len(class_names))])
+
+# Visualize feature space with centroids and class labels
+visualize_feature_space_with_centroids(all_embeddings, all_labels_array, class_centroids, method='tsne', class_names=class_names)
+
+
+# Initialize variable to count the number of perturbed images created
+num_perturbed_images = 0
+
+
+# Process images
+for i, (data, target) in enumerate(test_loader):
+    if i >= num_images:
+        break
+
+    data, target = data.to(device), target.to(device)
+    all_labels.append(target.item())
+
+#    net.to(device)
+#    net.eval()
+
+    # Original activations
+    original_activations = {}
+    original_hooks = register_hooks(net, original_activations) # Use the register_hooks function you defined
+
+    # Original prediction
+    with torch.no_grad():
+        output = net(data)
+    original_pred = output.argmax(dim=1).item()
+    all_original_preds.append(original_pred)
+    correct_original += (original_pred == target.item())
+
+    # Remove original hooks
+    for hook in original_hooks:
+        hook.remove()
+
+   # Adversarial example generation
+    adversarial_activations = {}
+    adversarial_hooks = register_hooks(net, adversarial_activations) # Use the register_hooks function you defined
+    adversarial_data = pgd_attack(net, data.clone(), target, epsilon=epsilon, step_size=step_size, num_steps=num_steps) # Pass target to your existing function
+
+    # Increment the number of perturbed images
+    num_perturbed_images += 1
+
+    # Adversarial prediction
+    with torch.no_grad():
+        output = net(adversarial_data)
+    adversarial_pred = output.argmax(dim=1).item()
+    correct_adversarial += (adversarial_pred == target.item()) # compare with target to see if adversarial example misclassifies the image
+
+    # Remove adversarial hooks
+    for hook in adversarial_hooks:
+        hook.remove()
+
+
+layer_vulnerabilities = {
+    name: (adversarial_activations[name] - original_activations[name]).norm(2).item()
+    for name in original_activations.keys() if name in adversarial_activations
+}
+
+sorted_layers = sorted(layer_vulnerabilities.items(), key=lambda x: x[1], reverse=True)
+print("\nLayer Vulnerabilities (most affected):")
+for layer, vulnerability in sorted_layers:
+    print(f"{layer}: {vulnerability:.4f}")
+
+
+print(f"\nNumber of perturbed images: {num_perturbed_images}")
+
+#print the acc on the perturbed images based on the perturbed image count
+print(f"\nAccuracy on perturbed images: {correct_adversarial / num_perturbed_images * 100:.2f}%")
+
+print(f"\nDeceive rate of the perturbation (wrongly classified perturbed images): {100 - (correct_adversarial / num_perturbed_images * 100):.2f}%")
+
+accuracy_original = correct_original / num_images
+accuracy_adversarial = correct_adversarial / num_images
+
+print(f'\nAccuracy on original images: {accuracy_original * 100:.2f}%')
+print(f'Accuracy on adversarial images: {accuracy_adversarial * 100:.2f}%')
+
